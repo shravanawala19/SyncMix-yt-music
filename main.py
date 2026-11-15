@@ -8,6 +8,7 @@ on the main screen — supporting Standard Spotify-style Crossfade, GitHub AutoM
 (VertexSelection/automix-engine), and Pro DJ Mix (kckDeepak/AI-DJ-Mixing-System).
 """
 
+import ctypes
 import hashlib
 import json
 import math
@@ -16,7 +17,7 @@ import sys
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
@@ -39,8 +40,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+def _resource_path(rel_path: str) -> str:
+    """Resolve asset paths for both source execution and PyInstaller bundles."""
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, rel_path)
+
+
+def _get_profile_dir() -> str:
+    """Store QtWebEngine browser profile in LocalAppData when running frozen."""
+    if getattr(sys, "frozen", False):
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(local_app_data, "SyncMix Crossfader", "profile_data")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_data")
+
+
 YTM_URL = "https://music.youtube.com"
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_data")
+PROFILE_DIR = _get_profile_dir()
 
 MIX_MODE_STANDARD = "Standard Crossfade (Spotify)"
 MIX_MODE_AUTOMIX = "GitHub AutoMix (VertexSelection)"
@@ -1405,9 +1420,33 @@ class CrossfaderWindow(QMainWindow):
             self._set_badge(f"Tempo Release ({rate:.2f}x → 1.00x)", "#1c2f4a", "#66b2ff")
 
 
+def _load_app_icon() -> QIcon:
+    """Load the SyncMix app icon from bundled or local assets."""
+    icon = QIcon()
+    for rel in (os.path.join("assets", "icon.ico"), os.path.join("assets", "icon.png")):
+        path = _resource_path(rel)
+        if os.path.isfile(path):
+            icon.addFile(path)
+    return icon
+
+
 def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "SyncMix.Crossfader.App"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app_icon = _load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
     win = CrossfaderWindow()
+    if not app_icon.isNull():
+        win.setWindowIcon(app_icon)
     win.show()
     sys.exit(app.exec())
 
