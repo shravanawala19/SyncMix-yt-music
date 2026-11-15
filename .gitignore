@@ -1,0 +1,17 @@
+# Browser profile, cookies, and session cache (private)
+profile_data/
+brave_profile/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Environment & OS files
+.env
+*.log
+.DS_Store
+Thumbs.db
