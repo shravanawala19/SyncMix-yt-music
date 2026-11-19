@@ -1,6 +1,8 @@
 # Browser profile, cookies, and session cache (private)
 profile_data/
 brave_profile/
+settings.json
+track_cache.json
 
 # Python artifacts
 __pycache__/
