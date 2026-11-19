@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -61,6 +62,15 @@ MIX_MODE_STANDARD = "Standard Crossfade (Spotify)"
 MIX_MODE_AUTOMIX = "GitHub AutoMix (VertexSelection)"
 MIX_MODE_PRO_DJ = "Pro DJ Mix (AI-DJ-Mixing-System)"
 WARMUP_LEAD_SEC = 6.0
+
+# Real-time Web Audio silence detection (detect silent outro / quiet part and mix early)
+SILENCE_RMS_THRESHOLD = 0.008      # ~ -42 dBFS: audio below this counts as silent
+SILENCE_RESUME_THRESHOLD = 0.014   # ~ -37 dBFS: hysteresis to reset silence timer
+AUDIBLE_CONFIRM_RMS = 0.015        # ~ -36.5 dBFS: require real audio before allowing silence trigger
+SILENCE_HOLD_SEC = 1.6             # Continuous silence duration required before triggering mix
+SILENCE_MIN_ELAPSED_SEC = 20.0     # Never trigger during track intros / first 20s
+SILENCE_MIN_PROGRESS = 0.55        # Allow silence mix once past 55% of track OR within last 45s
+SILENCE_OUTRO_WINDOW_SEC = 45.0
 
 # kckDeepak/AI-DJ-Mixing-System constants (generate_mixing_plan.py & mixing_engine.py)
 PRO_DJ_RAMP_STEPS = 32
@@ -307,6 +317,52 @@ INSPECT_JS = r"""
         videoId = params.get('v') || '';
     }
 
+    let audioRms = -1;
+    let audioReady = false;
+    if (video && !video.paused && video.readyState >= 2) {
+        try {
+            let meter = window.__syncmixMeter;
+            if (!meter || meter.video !== video) {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                const fx = window.__syncmixProFx;
+                const ctx = (fx && fx.ctx) || window.__syncmixAudioCtx || new Ctx();
+                window.__syncmixAudioCtx = ctx;
+                const src = video.__syncmixMediaSrc || ctx.createMediaElementSource(video);
+                video.__syncmixMediaSrc = src;
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 1024;
+                src.connect(analyser);
+                if (!fx || fx.video !== video) {
+                    if (!video.__syncmixDirectConnected) {
+                        src.connect(ctx.destination);
+                        video.__syncmixDirectConnected = true;
+                    }
+                }
+                meter = {
+                    video,
+                    ctx,
+                    src,
+                    analyser,
+                    buf: new Float32Array(analyser.fftSize)
+                };
+                window.__syncmixMeter = meter;
+            }
+            if (meter.ctx.state === 'suspended') {
+                meter.ctx.resume().catch(() => {});
+            }
+            if (meter.ctx.state === 'running') {
+                meter.analyser.getFloatTimeDomainData(meter.buf);
+                let sumSq = 0;
+                for (let i = 0; i < meter.buf.length; i++) {
+                    const s = meter.buf[i];
+                    sumSq += s * s;
+                }
+                audioRms = Math.sqrt(sumSq / meter.buf.length);
+                audioReady = true;
+            }
+        } catch (e) {}
+    }
+
     return JSON.stringify({
         hasVideo: !!video,
         isAd: !!document.querySelector('.ad-showing, .ad-interrupting'),
@@ -316,6 +372,8 @@ INSPECT_JS = r"""
         ended: video ? video.ended : false,
         volume: video ? video.volume : 1.0,
         playbackRate: video ? (video.playbackRate || 1.0) : 1.0,
+        audioRms,
+        audioReady,
         title,
         artist,
         videoId,
@@ -345,6 +403,8 @@ class DeckState:
     ended: bool = False
     volume: float = 1.0
     playback_rate: float = 1.0
+    audio_rms: float = -1.0
+    audio_ready: bool = False
     title: str = "Play any song or playlist on YouTube Music"
     artist: str = ""
     video_id: str = ""
@@ -360,6 +420,80 @@ class DeckState:
         if self.duration <= 0:
             return 0.0
         return max(0.0, self.duration - self.current_time)
+
+
+@dataclass
+class SilenceTracker:
+    """Tracks live audio RMS on the active deck to detect silent sections safely."""
+
+    video_id: str = ""
+    heard_audio: bool = False
+    silence_elapsed: float = 0.0
+    last_track_time: float = 0.0
+    last_poll_ts: float = 0.0
+
+    def reset(self, video_id: str = "") -> None:
+        self.video_id = video_id
+        self.heard_audio = False
+        self.silence_elapsed = 0.0
+        self.last_track_time = 0.0
+        self.last_poll_ts = 0.0
+
+    def update(self, st: DeckState, now_ts: float) -> bool:
+        if not st.video_id or st.video_id != self.video_id:
+            self.reset(st.video_id)
+            self.last_poll_ts = now_ts
+            self.last_track_time = st.current_time
+            return False
+
+        # Reset silence timer if user scrubbed/seeked backward significantly
+        if st.current_time + 1.5 < self.last_track_time:
+            self.silence_elapsed = 0.0
+
+        dt = 0.0
+        if self.last_poll_ts > 0.0:
+            dt = max(0.0, min(1.0, now_ts - self.last_poll_ts))
+        self.last_poll_ts = now_ts
+        self.last_track_time = st.current_time
+
+        if (
+            st.paused
+            or st.is_ad
+            or st.duration <= SILENCE_MIN_ELAPSED_SEC
+            or st.volume < 0.2
+            or not st.audio_ready
+            or st.audio_rms < 0.0
+        ):
+            self.silence_elapsed = 0.0
+            return False
+
+        if st.audio_rms >= AUDIBLE_CONFIRM_RMS:
+            self.heard_audio = True
+
+        if not self.heard_audio:
+            self.silence_elapsed = 0.0
+            return False
+
+        in_mixable_zone = (
+            st.current_time >= SILENCE_MIN_ELAPSED_SEC
+            and (
+                st.current_time >= st.duration * SILENCE_MIN_PROGRESS
+                or st.remaining <= SILENCE_OUTRO_WINDOW_SEC
+            )
+        )
+        if not in_mixable_zone:
+            self.silence_elapsed = 0.0
+            return False
+
+        if st.audio_rms < SILENCE_RMS_THRESHOLD:
+            self.silence_elapsed += dt
+        elif st.audio_rms >= SILENCE_RESUME_THRESHOLD:
+            self.silence_elapsed = 0.0
+
+        return self.silence_elapsed >= SILENCE_HOLD_SEC
+
+    def is_triggered(self) -> bool:
+        return self.heard_audio and self.silence_elapsed >= SILENCE_HOLD_SEC
 
 
 class SilentWebPage(QWebEnginePage):
@@ -661,6 +795,7 @@ class CrossfaderWindow(QMainWindow):
         self.release_start_rate = 1.0
         self.release_step = 0
         self.last_applied_rate = {"A": 1.0, "B": 1.0}
+        self.silence_tracker = SilenceTracker()
 
         self._build_ui()
         self._load_initial_pages()
@@ -743,6 +878,13 @@ class CrossfaderWindow(QMainWindow):
         self.auto_cb.setChecked(True)
         self.auto_cb.setStyleSheet("font-weight: bold; color: #1db954; border: none;")
 
+        self.silence_cb = QCheckBox("Silence Mix")
+        self.silence_cb.setChecked(True)
+        self.silence_cb.setToolTip(
+            "Detect silent parts / quiet outros in real time and start mixing automatically from that point"
+        )
+        self.silence_cb.setStyleSheet("font-weight: bold; color: #38bdf8; border: none;")
+
         mode_lbl = QLabel("Mix Mode:")
         mode_lbl.setStyleSheet("color: #b0b0c0; border: none;")
         self.mode_combo = QComboBox()
@@ -776,6 +918,7 @@ class CrossfaderWindow(QMainWindow):
 
         bar_layout.addLayout(info_col, 3)
         bar_layout.addWidget(self.auto_cb)
+        bar_layout.addWidget(self.silence_cb)
         bar_layout.addWidget(mode_lbl)
         bar_layout.addWidget(self.mode_combo)
         bar_layout.addWidget(self.dur_lbl)
@@ -893,11 +1036,13 @@ class CrossfaderWindow(QMainWindow):
             " if (!fx || fx.video !== v) {"
             "  try {"
             "   const Ctx = window.AudioContext || window.webkitAudioContext;"
-            "   const ctx = fx && fx.ctx ? fx.ctx : new Ctx();"
+            "   const ctx = (fx && fx.ctx) || window.__syncmixAudioCtx || new Ctx();"
+            "   window.__syncmixAudioCtx = ctx;"
             "   if (ctx.state === 'suspended') ctx.resume().catch(()=>{});"
             "   const src = v.__syncmixMediaSrc || ctx.createMediaElementSource(v);"
             "   v.__syncmixMediaSrc = src;"
-            "   if (fx && fx.src) { try { fx.src.disconnect(); } catch (e) {} }"
+            "   try { src.disconnect(); } catch (e) {}"
+            "   v.__syncmixDirectConnected = false;"
             "   const hpf = (fx && fx.hpf) || ctx.createBiquadFilter(); hpf.type = 'highpass';"
             "   const lpf = (fx && fx.lpf) || ctx.createBiquadFilter(); lpf.type = 'lowpass';"
             "   const dryGain = (fx && fx.dryGain) || ctx.createGain();"
@@ -912,6 +1057,9 @@ class CrossfaderWindow(QMainWindow):
             "    echoLpf.connect(echoWet); echoWet.connect(ctx.destination);"
             "   }"
             "   src.connect(hpf);"
+            "   if (window.__syncmixMeter && window.__syncmixMeter.video === v && window.__syncmixMeter.analyser) {"
+            "    try { src.connect(window.__syncmixMeter.analyser); } catch (e) {}"
+            "   }"
             "   fx = { video: v, ctx, src, hpf, lpf, dryGain, delay, fb, echoLpf, echoWet };"
             "   window.__syncmixProFx = fx;"
             "  } catch (e) { return; }"
@@ -1033,6 +1181,9 @@ class CrossfaderWindow(QMainWindow):
         st.ended = bool(res.get("ended", False))
         st.volume = float(res.get("volume", 1.0) or 0.0)
         st.playback_rate = float(res.get("playbackRate", 1.0) or 1.0)
+        raw_rms = res.get("audioRms", -1.0)
+        st.audio_rms = float(raw_rms) if raw_rms is not None else -1.0
+        st.audio_ready = bool(res.get("audioReady", False))
         st.title = str(res.get("title", "") or "")
         st.artist = str(res.get("artist", "") or "")
         st.video_id = str(res.get("videoId", "") or "")
@@ -1044,6 +1195,7 @@ class CrossfaderWindow(QMainWindow):
                 self.last_faded_video_id = ""
             self._update_now_playing_bar(st)
             if self.auto_cb.isChecked() and not self.is_fading:
+                self.silence_tracker.update(st, time.monotonic())
                 self._preload_outgoing_tail()
                 self._check_spotify_crossfade()
         else:
@@ -1163,15 +1315,18 @@ class CrossfaderWindow(QMainWindow):
             return
         if self.last_faded_video_id == act.video_id:
             return
+        if not tail.cue_ready or tail.cued_video_id != act.video_id:
+            return
 
         smart_fade = self._get_target_outro_window(act)
-        if (
-            act.remaining <= smart_fade
-            and act.remaining > 0.2
-            and tail.cue_ready
-            and tail.cued_video_id == act.video_id
+        if act.remaining <= smart_fade and act.remaining > 0.2:
+            self._trigger_spotify_crossfade(act, smart_fade, trigger_reason="time")
+        elif (
+            self.silence_cb.isChecked()
+            and self.silence_tracker.is_triggered()
+            and act.remaining > 0.5
         ):
-            self._trigger_spotify_crossfade(act, smart_fade)
+            self._trigger_spotify_crossfade(act, smart_fade, trigger_reason="silence")
 
     def _mute_and_advance_main_deck(self):
         if not self.is_fading:
@@ -1181,11 +1336,14 @@ class CrossfaderWindow(QMainWindow):
         self.last_applied_rate["A"] = 1.0
         self._advance_main_queue()
 
-    def _trigger_spotify_crossfade(self, act: DeckState, smart_fade: float):
+    def _trigger_spotify_crossfade(
+        self, act: DeckState, smart_fade: float, trigger_reason: str = "time"
+    ):
         if self.is_fading:
             return
         self.release_timer.stop()
         self.release_step = 0
+        self.silence_tracker.reset()
 
         self.is_fading = True
         self._update_poll_cadence()
@@ -1193,7 +1351,10 @@ class CrossfaderWindow(QMainWindow):
         self.outgoing_video_id = act.video_id
         self.last_faded_video_id = act.video_id
         self.fade_elapsed = 0.0
-        self.fade_duration = max(1.0, min(smart_fade, act.remaining))
+        if trigger_reason == "silence":
+            self.fade_duration = max(1.5, min(smart_fade, 4.5, act.remaining))
+        else:
+            self.fade_duration = max(1.0, min(smart_fade, act.remaining))
 
         self.out_bpm = estimate_track_bpm(act.video_id, act.title, act.duration)
         self.out_key = estimate_track_key(act.video_id, act.title)
@@ -1238,14 +1399,19 @@ class CrossfaderWindow(QMainWindow):
         # Brief 25ms balanced micro-handoff before Deck A mutes and advances
         QTimer.singleShot(25, self._mute_and_advance_main_deck)
 
-        if self._is_github_automix():
+        if trigger_reason == "silence":
+            badge = f"Silence Mix ({self.fade_duration:.1f}s)"
+            self._set_badge(badge, "#0f3a4a", "#38bdf8")
+        elif self._is_github_automix():
             badge = f"AutoMix 32-Beat ({self.fade_duration:.1f}s)"
+            self._set_badge(badge, "#4a3210", "#ffb84d")
         elif self._is_pro_dj_mix():
             key_tag = "Match" if self.pro_key_score >= 0.8 else ("Clash" if self.pro_key_score < 0 else "Neutral")
             badge = f"Pro DJ ({self.out_key}->{self.in_key} {key_tag}, {self.fade_duration:.1f}s)"
+            self._set_badge(badge, "#4a3210", "#ffb84d")
         else:
             badge = f"Crossfading ({self.fade_duration:.1f}s)"
-        self._set_badge(badge, "#4a3210", "#ffb84d")
+            self._set_badge(badge, "#4a3210", "#ffb84d")
         self.fade_timer.start(50)
 
     def _step_fade(self):
@@ -1387,6 +1553,7 @@ class CrossfaderWindow(QMainWindow):
         tail.warm_running = False
 
         self.is_fading = False
+        self.silence_tracker.reset()
         self._update_poll_cadence()
         if self._is_github_automix() and abs(self.release_start_rate - 1.0) > 0.005:
             interval_ms = int(round((TEMPO_RELEASE_SECONDS / RELEASE_CONTROL_POINTS) * 1000))
