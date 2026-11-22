@@ -72,10 +72,16 @@ PROFILE_DIR = _get_profile_dir()
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 TRACK_CACHE_PATH = os.path.join(DATA_DIR, "track_cache.json")
 
-MIX_MODE_STANDARD = "Standard Crossfade (Spotify)"
-MIX_MODE_AUTOMIX = "GitHub AutoMix (VertexSelection)"
-MIX_MODE_PRO_DJ = "Pro DJ Mix (AI-DJ-Mixing-System)"
+MIX_MODE_STANDARD = "Crossfade"
+MIX_MODE_AUTOMIX = "32-Beat AutoMix"
+MIX_MODE_PRO_DJ = "Pro DJ"
 MIX_MODE_APPLE = "Apple AutoMix"
+LEGACY_MIX_MODE_MAP = {
+    "Standard Crossfade (Spotify)": MIX_MODE_STANDARD,
+    "GitHub AutoMix (VertexSelection)": MIX_MODE_AUTOMIX,
+    "Pro DJ Mix (AI-DJ-Mixing-System)": MIX_MODE_PRO_DJ,
+    "Apple AutoMix": MIX_MODE_APPLE,
+}
 WARMUP_LEAD_SEC = 6.0
 
 # Real-time Web Audio silence detection (detect silent outro / quiet part and mix early)
@@ -1173,19 +1179,21 @@ class SettingsStore:
 
 
 class MiniVisualizerWidget(QWidget):
-    """Compact 10-band live spectrum visualizer for the SyncMix top bar."""
+    """Compact 10-band studio spectrum visualizer with subtle peak caps."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(64, 28)
-        self.targets = [0.05] * 10
-        self.levels = [0.05] * 10
-        self.bar_color = QColor("#1db954")
+        self.setFixedSize(56, 28)
+        self.targets = [0.06] * 10
+        self.levels = [0.06] * 10
+        self.peaks = [0.06] * 10
+        self.bar_color = QColor("#ededed")
+        self.peak_color = QColor("#ff4d6d")
         self.setToolTip("Live Web Audio spectrum")
 
     def set_levels(self, bands: list[float], color_hex: str) -> None:
         if isinstance(bands, list) and len(bands) >= 10:
-            self.targets = [max(0.05, min(1.0, float(v))) for v in bands[:10]]
+            self.targets = [max(0.06, min(1.0, float(v))) for v in bands[:10]]
         self.bar_color = QColor(color_hex)
 
     def step_animation(self) -> None:
@@ -1193,9 +1201,15 @@ class MiniVisualizerWidget(QWidget):
         for i in range(10):
             tgt = self.targets[i]
             cur = self.levels[i]
-            nxt = cur + (tgt - cur) * (0.55 if tgt > cur else 0.25)
-            if abs(nxt - cur) > 0.005:
+            nxt = cur + (tgt - cur) * (0.52 if tgt > cur else 0.22)
+            if abs(nxt - cur) > 0.004:
                 self.levels[i] = nxt
+                changed = True
+            if nxt >= self.peaks[i]:
+                self.peaks[i] = nxt
+                changed = True
+            elif self.peaks[i] > 0.06:
+                self.peaks[i] = max(0.06, self.peaks[i] - 0.015)
                 changed = True
         if changed:
             self.update()
@@ -1208,15 +1222,21 @@ class MiniVisualizerWidget(QWidget):
         n = len(self.levels)
         gap = 2
         bar_w = max(2, (w - gap * (n - 1)) // n)
+        painter.setPen(Qt.PenStyle.NoPen)
         for i, lvl in enumerate(self.levels):
-            bar_h = max(3, int(lvl * (h - 2)))
+            bar_h = max(3, int(lvl * (h - 4)))
             x = i * (bar_w + gap)
             y = h - bar_h
             c = QColor(self.bar_color)
-            c.setAlpha(int(140 + 115 * lvl))
-            painter.setPen(Qt.PenStyle.NoPen)
+            c.setAlpha(int(120 + 135 * lvl))
             painter.setBrush(c)
             painter.drawRoundedRect(x, y, bar_w, bar_h, 1.5, 1.5)
+            if self.peaks[i] > 0.16:
+                peak_y = max(0, h - int(self.peaks[i] * (h - 4)) - 2)
+                pc = QColor(self.peak_color)
+                pc.setAlpha(210)
+                painter.setBrush(pc)
+                painter.drawRoundedRect(x, peak_y, bar_w, 2, 1.0, 1.0)
         painter.end()
 
 
@@ -1469,9 +1489,9 @@ def fmt_time(seconds: float) -> str:
 class CrossfaderWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SyncMix — YouTube Music Crossfade Player")
+        self.setWindowTitle("SyncMix — YouTube Music AutoMix")
         self.resize(1280, 860)
-        self.setStyleSheet("background-color: #0e0e13; color: #eaeaf0;")
+        self.setStyleSheet("background-color: #0f0f10; color: #ededed;")
 
         os.makedirs(PROFILE_DIR, exist_ok=True)
         self.profile = QWebEngineProfile("SyncMixProfile", self)
@@ -1564,36 +1584,58 @@ class CrossfaderWindow(QMainWindow):
         view.setPage(page)
         return view
 
+    def _make_divider(self) -> QFrame:
+        div = QFrame()
+        div.setFixedSize(1, 28)
+        div.setStyleSheet("background-color: rgba(255, 255, 255, 0.08); border: none;")
+        return div
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # --- Spotify-Style Top Crossfade / AutoMix Bar ---
+        # --- Studio Mastering Top Control Bar (64px, 4px grid, Graphite + single coral accent) ---
         top_bar = QFrame()
-        top_bar.setFixedHeight(74)
+        top_bar.setFixedHeight(64)
         top_bar.setStyleSheet(
-            "background-color: #16161c; border: 1px solid #2c2c36; border-radius: 10px;"
+            "QFrame#SyncMixTopBar {"
+            " background-color: #141415;"
+            " border: 1px solid rgba(255, 255, 255, 0.08);"
+            " border-radius: 12px;"
+            "}"
         )
+        top_bar.setObjectName("SyncMixTopBar")
+
         bar_layout = QHBoxLayout(top_bar)
-        bar_layout.setContentsMargins(14, 8, 14, 8)
-        bar_layout.setSpacing(10)
+        bar_layout.setContentsMargins(16, 12, 16, 12)
+        bar_layout.setSpacing(12)
+
+        # Zone 1: Now Playing (Live Visualizer + Track Info + Monospace Telemetry + 4px Rail)
+        self.visualizer = MiniVisualizerWidget()
 
         info_col = QVBoxLayout()
-        info_col.setSpacing(4)
+        info_col.setContentsMargins(0, 0, 0, 0)
+        info_col.setSpacing(6)
 
         title_row = QHBoxLayout()
-        self.title_lbl = QLabel("Play any song or playlist on YouTube Music")
-        self.title_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
-        self.title_lbl.setStyleSheet("color: #f4f4f8; border: none;")
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+
+        self.title_lbl = QLabel("Play any track on YouTube Music")
+        self.title_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
+        self.title_lbl.setStyleSheet("color: #ededed; border: none; background: transparent;")
 
         self.artist_lbl = QLabel("")
-        self.artist_lbl.setStyleSheet("color: #8e8ea0; font-size: 11px; border: none;")
+        self.artist_lbl.setStyleSheet("color: #85858b; font-size: 12px; border: none; background: transparent;")
 
         self.time_lbl = QLabel("0:00 / 0:00")
-        self.time_lbl.setStyleSheet("color: #b0b0c0; font-size: 11px; border: none;")
+        mono_font = QFont("Cascadia Mono", 9)
+        mono_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.time_lbl.setFont(mono_font)
+        self.time_lbl.setStyleSheet("color: #a1a1a6; border: none; background: transparent;")
 
         title_row.addWidget(self.title_lbl)
         title_row.addWidget(self.artist_lbl)
@@ -1604,16 +1646,16 @@ class CrossfaderWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(5)
+        self.progress.setFixedHeight(4)
         self.progress.setStyleSheet(
             """
             QProgressBar {
-                background-color: #262632;
+                background-color: #232325;
                 border-radius: 2px;
                 border: none;
             }
             QProgressBar::chunk {
-                background-color: #1db954;
+                background-color: #ff4d6d;
                 border-radius: 2px;
             }
             """
@@ -1622,89 +1664,136 @@ class CrossfaderWindow(QMainWindow):
         info_col.addLayout(title_row)
         info_col.addWidget(self.progress)
 
-        self.auto_cb = QCheckBox("Smart AutoMix")
+        # Zone 2: Mix Controls (quiet neutral chrome, uniform 32px height, 8px radius)
+        cb_style = (
+            "QCheckBox {"
+            " color: #a1a1a6;"
+            " font-size: 12px;"
+            " font-weight: 400;"
+            " spacing: 6px;"
+            " border: none;"
+            " background: transparent;"
+            "}"
+            "QCheckBox:hover { color: #ededed; }"
+            "QCheckBox:checked { color: #ededed; }"
+        )
+        self.auto_cb = QCheckBox("AutoMix")
         self.auto_cb.setChecked(True)
-        self.auto_cb.setStyleSheet("font-weight: bold; color: #1db954; border: none;")
+        self.auto_cb.setToolTip("Automatically blend into the next queued track")
+        self.auto_cb.setStyleSheet(cb_style)
 
-        self.silence_cb = QCheckBox("Silence Mix")
+        self.silence_cb = QCheckBox("Silence")
         self.silence_cb.setChecked(True)
         self.silence_cb.setToolTip(
-            "Detect silent parts / quiet outros in real time and start mixing automatically from that point"
+            "Detect silent parts and quiet outros in real time and start mixing from that point"
         )
-        self.silence_cb.setStyleSheet("font-weight: bold; color: #38bdf8; border: none;")
+        self.silence_cb.setStyleSheet(cb_style)
 
-        mode_lbl = QLabel("Mix Mode:")
-        mode_lbl.setStyleSheet("color: #b0b0c0; border: none;")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems([MIX_MODE_STANDARD, MIX_MODE_AUTOMIX, MIX_MODE_PRO_DJ, MIX_MODE_APPLE])
-        self.mode_combo.setStyleSheet(
-            "background-color: #22222a; border: 1px solid #383844; border-radius: 4px; padding: 3px 8px;"
+        control_style = (
+            "QComboBox, QSpinBox {"
+            " background-color: #1f1f22;"
+            " color: #ededed;"
+            " border: 1px solid rgba(255, 255, 255, 0.08);"
+            " border-radius: 8px;"
+            " padding: 0px 10px;"
+            " font-size: 12px;"
+            "}"
+            "QComboBox:hover, QSpinBox:hover {"
+            " border-color: rgba(255, 255, 255, 0.18);"
+            " background-color: #252529;"
+            "}"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox QAbstractItemView {"
+            " background-color: #19191b;"
+            " color: #ededed;"
+            " border: 1px solid rgba(255, 255, 255, 0.10);"
+            " selection-background-color: #2a2a2e;"
+            " selection-color: #ffffff;"
+            " outline: none;"
+            "}"
         )
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.setFixedHeight(32)
+        self.mode_combo.addItems([MIX_MODE_STANDARD, MIX_MODE_AUTOMIX, MIX_MODE_PRO_DJ, MIX_MODE_APPLE])
+        self.mode_combo.setToolTip(
+            "Crossfade (Spotify-style) · 32-Beat AutoMix (VertexSelection) · Pro DJ (AI-DJ-Mixing-System) · Apple AutoMix"
+        )
+        self.mode_combo.setStyleSheet(control_style)
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
 
-        self.dur_lbl = QLabel("Crossfade:")
-        self.dur_lbl.setStyleSheet("color: #b0b0c0; border: none;")
+        self.dur_lbl = QLabel("Fade")
+        self.dur_lbl.setStyleSheet("color: #85858b; font-size: 12px; border: none; background: transparent;")
         self.dur_spin = QSpinBox()
+        self.dur_spin.setFixedHeight(32)
         self.dur_spin.setRange(1, 15)
         self.dur_spin.setValue(6)
         self.dur_spin.setSuffix("s")
-        self.dur_spin.setStyleSheet(
-            "background-color: #22222a; border: 1px solid #383844; border-radius: 4px; padding: 3px 6px;"
-        )
+        self.dur_spin.setStyleSheet(control_style)
 
         self.curve_combo = QComboBox()
+        self.curve_combo.setFixedHeight(32)
         self.curve_combo.addItems(["Equal Power", "Smooth S-Curve", "Linear"])
-        self.curve_combo.setToolTip("Select volume fade curve for Standard Crossfade")
-        self.curve_combo.setStyleSheet(
-            "background-color: #22222a; border: 1px solid #383844; border-radius: 4px; padding: 3px 8px;"
+        self.curve_combo.setToolTip("Volume fade curve for Crossfade mode")
+        self.curve_combo.setStyleSheet(control_style)
+
+        # Zone 3: Signature Status Dot + Primary Mix Now Action (with Ctrl+M keycap)
+        status_wrap = QHBoxLayout()
+        status_wrap.setContentsMargins(0, 0, 0, 0)
+        status_wrap.setSpacing(6)
+
+        self.status_dot = QFrame()
+        self.status_dot.setFixedSize(6, 6)
+        self.status_dot.setStyleSheet(
+            "background-color: #4cc38a; border-radius: 3px; border: none;"
         )
 
-        self.visualizer = MiniVisualizerWidget()
+        self.status_badge = QLabel("Ad-block active")
+        self.status_badge.setStyleSheet(
+            "color: #a1a1a6; font-size: 12px; font-weight: 400; border: none; background: transparent;"
+        )
+        status_wrap.addWidget(self.status_dot)
+        status_wrap.addWidget(self.status_badge)
 
-        self.mix_now_btn = QPushButton("Mix Now")
+        self.mix_now_btn = QPushButton("Mix Now   Ctrl+M")
+        self.mix_now_btn.setFixedHeight(32)
         self.mix_now_btn.setToolTip(
-            "Immediately start a smooth transition into the next queued song (Ctrl+M)"
+            "Start a smooth transition into the next queued track (Ctrl+M)"
         )
         self.mix_now_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mix_now_btn.setStyleSheet(
             """
             QPushButton {
-                background-color: #252536;
-                color: #f1f5f9;
-                border: 1px solid #3d3d56;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: bold;
+                background-color: #ededed;
+                color: #0f0f10;
+                border: none;
+                border-radius: 8px;
+                padding: 0px 14px;
+                font-size: 12px;
+                font-weight: 600;
             }
             QPushButton:hover {
-                background-color: #32324a;
-                border-color: #ff5e7e;
-                color: #ffffff;
+                background-color: #ffffff;
             }
             QPushButton:pressed {
-                background-color: #4a1525;
+                background-color: #d4d4d8;
             }
             """
         )
         self.mix_now_btn.clicked.connect(self._trigger_manual_mix)
 
-        self.status_badge = QLabel("Ad-Block ON")
-        self.status_badge.setStyleSheet(
-            "background-color: #123d28; color: #3be38e; padding: 4px 10px; border-radius: 8px; font-size: 11px; font-weight: bold; border: none;"
-        )
-
         bar_layout.addWidget(self.visualizer)
         bar_layout.addLayout(info_col, 3)
+        bar_layout.addWidget(self._make_divider())
         bar_layout.addWidget(self.auto_cb)
         bar_layout.addWidget(self.silence_cb)
-        bar_layout.addWidget(mode_lbl)
         bar_layout.addWidget(self.mode_combo)
         bar_layout.addWidget(self.dur_lbl)
         bar_layout.addWidget(self.dur_spin)
         bar_layout.addWidget(self.curve_combo)
+        bar_layout.addWidget(self._make_divider())
+        bar_layout.addLayout(status_wrap)
         bar_layout.addWidget(self.mix_now_btn)
-        bar_layout.addWidget(self.status_badge)
 
         self.auto_cb.toggled.connect(self._save_settings)
         self.silence_cb.toggled.connect(self._save_settings)
@@ -1738,8 +1827,11 @@ class CrossfaderWindow(QMainWindow):
                     pass
             if "curve" in cfg and self.curve_combo.findText(str(cfg["curve"])) >= 0:
                 self.curve_combo.setCurrentText(str(cfg["curve"]))
-            if "mix_mode" in cfg and self.mode_combo.findText(str(cfg["mix_mode"])) >= 0:
-                self.mode_combo.setCurrentText(str(cfg["mix_mode"]))
+            if "mix_mode" in cfg:
+                saved_mode = str(cfg["mix_mode"])
+                mapped_mode = LEGACY_MIX_MODE_MAP.get(saved_mode, saved_mode)
+                if self.mode_combo.findText(mapped_mode) >= 0:
+                    self.mode_combo.setCurrentText(mapped_mode)
             geom = cfg.get("window_geometry")
             if isinstance(geom, list) and len(geom) == 4:
                 try:
@@ -1854,34 +1946,28 @@ class CrossfaderWindow(QMainWindow):
         super().closeEvent(event)
 
     def _is_standard_crossfade(self) -> bool:
-        return self.mode_combo.currentText().startswith("Standard Crossfade")
+        return self.mode_combo.currentText() == MIX_MODE_STANDARD
 
     def _is_github_automix(self) -> bool:
-        return self.mode_combo.currentText().startswith("GitHub AutoMix")
+        return self.mode_combo.currentText() == MIX_MODE_AUTOMIX
 
     def _is_pro_dj_mix(self) -> bool:
-        return self.mode_combo.currentText().startswith("Pro DJ Mix")
+        return self.mode_combo.currentText() == MIX_MODE_PRO_DJ
 
     def _is_apple_automix(self) -> bool:
         return self.mode_combo.currentText() == MIX_MODE_APPLE
 
     def _armed_badge(self) -> tuple[str, str, str]:
         if self._is_apple_automix():
-            return ("Apple AutoMix Armed", "#4a1525", "#ff5e7e")
+            return ("Armed", "#141415", "#ff4d6d")
         if self._is_github_automix():
-            return ("AutoMix Armed (32-Beat)", "#1c2f4a", "#66b2ff")
+            return ("Armed · 32-beat", "#141415", "#ededed")
         if self._is_pro_dj_mix():
-            return ("Pro DJ Armed (Camelot+EQ)", "#251b45", "#b98eff")
-        return ("Crossfade Armed", "#1c2f4a", "#66b2ff")
+            return ("Armed · Pro DJ", "#141415", "#ededed")
+        return ("Armed", "#141415", "#ededed")
 
     def _buffering_badge(self) -> str:
-        if self._is_apple_automix():
-            return "Buffering Apple AutoMix..."
-        if self._is_github_automix():
-            return "Buffering AutoMix..."
-        if self._is_pro_dj_mix():
-            return "Buffering Pro DJ..."
-        return "Buffering Crossfade..."
+        return "Buffering..."
 
     def _on_mode_changed(self, _text: str):
         is_standard = self._is_standard_crossfade()
@@ -1903,11 +1989,9 @@ class CrossfaderWindow(QMainWindow):
                 if self.states["B"].cue_ready:
                     self._set_badge(*self._armed_badge())
                 elif self._is_apple_automix():
-                    self._set_badge("Apple AutoMix Ready", "#4a1525", "#ff5e7e")
-                elif self._is_pro_dj_mix():
-                    self._set_badge("Pro DJ Mix Ready", "#251b45", "#b98eff")
+                    self._set_badge("Ready", "#141415", "#ff4d6d")
                 else:
-                    self._set_badge("GitHub AutoMix Ready", "#1c2f4a", "#66b2ff")
+                    self._set_badge("Ready", "#141415", "#a1a1a6")
         else:
             self.release_timer.stop()
             self.release_step = 0
@@ -1917,9 +2001,9 @@ class CrossfaderWindow(QMainWindow):
             self._reset_pro_dj_fx("B")
             if not self.is_fading:
                 if self.states["B"].cue_ready:
-                    self._set_badge("Crossfade Armed", "#1c2f4a", "#66b2ff")
+                    self._set_badge("Armed", "#141415", "#ededed")
                 else:
-                    self._set_badge("Ad-Block ON", "#123d28", "#3be38e")
+                    self._set_badge("Ad-block active", "#141415", "#4cc38a")
 
     def _resolve_bpm(self, st: DeckState) -> float:
         if st.live_bpm >= 70.0 and st.bpm_confidence >= 0.35:
@@ -2182,10 +2266,15 @@ class CrossfaderWindow(QMainWindow):
             "(() => { const btn = document.querySelector('ytmusic-player-bar .next-button'); if (btn) { btn.click(); return; } const mp = document.getElementById('movie_player'); if (mp && mp.nextVideo) mp.nextVideo(); })();"
         )
 
-    def _set_badge(self, text: str, bg: str, fg: str):
+    def _set_badge(self, text: str, _bg: str, fg: str):
         self.status_badge.setText(text)
+        dot_color = fg if fg else "#a1a1a6"
+        self.status_dot.setStyleSheet(
+            f"background-color: {dot_color}; border-radius: 3px; border: none;"
+        )
+        text_color = "#ededed" if self.is_fading else "#a1a1a6"
         self.status_badge.setStyleSheet(
-            f"background-color: {bg}; color: {fg}; padding: 4px 10px; border-radius: 8px; font-size: 11px; font-weight: bold; border: none;"
+            f"color: {text_color}; font-size: 12px; font-weight: 400; border: none; background: transparent;"
         )
 
     def _poll_decks(self):
@@ -2256,15 +2345,12 @@ class CrossfaderWindow(QMainWindow):
 
             viz = res.get("vizBands")
             if st.paused or not st.audio_ready or not isinstance(viz, list):
-                viz = [0.05] * 10
-            if self.is_fading:
-                viz_color = "#ff5e7e" if self._is_apple_automix() else "#ffb84d"
-            elif self._is_apple_automix():
-                viz_color = "#ff5e7e"
-            elif self._is_pro_dj_mix():
-                viz_color = "#b98eff"
+                viz = [0.06] * 10
+                viz_color = "#52525b"
+            elif self.is_fading:
+                viz_color = "#ff4d6d"
             else:
-                viz_color = "#1db954"
+                viz_color = "#ededed"
             self.visualizer.set_levels(viz, viz_color)
 
             self._update_now_playing_bar(st)
@@ -2632,7 +2718,7 @@ class CrossfaderWindow(QMainWindow):
             if not self.fade_paused_by_user:
                 self.fade_paused_by_user = True
                 self._pause_deck("B")
-                self._set_badge("Mix Paused", "#272732", "#b0b0c0")
+                self._set_badge("Mix paused", "#141415", "#85858b")
             elif not tail.paused:
                 self._pause_deck("B")
             return
@@ -2798,7 +2884,7 @@ class CrossfaderWindow(QMainWindow):
             self.release_timer.start(interval_ms)
         else:
             self._set_deck_playback_rate("A", 1.0, force=True)
-            self._set_badge("Ad-Block ON", "#123d28", "#3be38e")
+            self._set_badge("Ad-block active", "#141415", "#4cc38a")
 
     def _step_tempo_release(self):
         self.release_step += 1
